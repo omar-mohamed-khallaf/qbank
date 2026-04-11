@@ -27,12 +27,6 @@ pub enum AppError {
     Tui(String),
 }
 
-impl From<reqwest::Error> for AppError {
-    fn from(e: reqwest::Error) -> Self {
-        AppError::Api(e.to_string())
-    }
-}
-
 impl From<pdf_extract::Error> for AppError {
     fn from(e: pdf_extract::Error) -> Self {
         AppError::PdfExtract(e.to_string())

@@ -14,7 +14,7 @@ use super::page::process_page;
 
 pub async fn process_pdf(
     pool: &DbPool,
-    client: &LlmClient,
+    client: &mut LlmClient,
     file_id: i64,
     pdf_path: PathBuf,
     state: SharedState,

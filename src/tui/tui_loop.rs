@@ -12,11 +12,17 @@ pub async fn run_tui_loop(state: SharedState) {
     stdout().execute(EnterAlternateScreen).unwrap();
     crossterm::terminal::enable_raw_mode().ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout())).unwrap();
+    let _ = terminal.clear();
     let mut current_scroll_target: Option<&str> = None;
 
     loop {
         let mut state_guard = state.write().await;
         let current_state = state_guard.clone();
+
+        if current_state.shutdown {
+            drop(state_guard);
+            break;
+        }
 
         if let Some(ref batch) = current_state.current_batch {
             let (_, end_page) = *batch;

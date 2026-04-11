@@ -72,6 +72,7 @@ pub struct AppState {
     pub settings: Settings,
     pub pages_scroll: usize,
     pub logs_scroll: usize,
+    pub shutdown: bool,
 }
 
 impl AppState {
@@ -86,6 +87,7 @@ impl AppState {
             settings,
             pages_scroll: 0,
             logs_scroll: 0,
+            shutdown: false,
         }
     }
 

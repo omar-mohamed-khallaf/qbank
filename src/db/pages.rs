@@ -67,6 +67,17 @@ pub async fn update_page_status(
     Ok(())
 }
 
+pub async fn get_page_status(pool: &DbPool, file_id: i64, page_number: i32) -> Result<Option<PageStatus>, AppError> {
+    let row = sqlx::query_as::<_, PageRow>(
+        "SELECT page_number, status, error_message FROM pages WHERE file_id = ? AND page_number = ?"
+    )
+    .bind(file_id)
+    .bind(page_number)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(std::convert::Into::into))
+}
+
 pub async fn get_failed_pages(pool: &DbPool, file_id: i64) -> Result<Vec<i32>, AppError> {
     let rows = sqlx::query(
         "SELECT page_number FROM pages WHERE file_id = ? AND status = 'failed' ORDER BY page_number"

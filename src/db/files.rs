@@ -42,6 +42,13 @@ pub async fn get_file_by_id(pool: &DbPool, id: i64) -> Result<Option<File>, AppE
     Ok(result.map(std::convert::Into::into))
 }
 
+pub async fn get_all_files(pool: &DbPool) -> Result<Vec<File>, AppError> {
+    let results = sqlx::query_as::<_, FileRow>("SELECT * FROM files ORDER BY id DESC")
+        .fetch_all(pool)
+        .await?;
+    Ok(results.into_iter().map(std::convert::Into::into).collect())
+}
+
 pub async fn get_file_status(pool: &DbPool, file_id: i64) -> Result<String, AppError> {
     let result = sqlx::query_as::<_, (i64,)>(
         "SELECT COUNT(*) FROM pages WHERE file_id = ? AND status = 'completed'",

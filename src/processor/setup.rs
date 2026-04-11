@@ -1,19 +1,22 @@
+use std::path::Path;
 use std::path::PathBuf;
+use std::thread;
 
 use anyhow::Result;
-use tracing::{error, info};
+use tracing::info;
 
 use crate::api::LlmClient;
+#[allow(unused_imports)]
+use crate::cli;
 use crate::db::DbPool;
 use crate::db::files as db_files;
 use crate::db::pages as db_pages;
 use crate::db::questions as db_questions;
-use crate::db::settings as db_settings;
 use crate::error::AppError;
 use crate::pdf as pdf_mod;
 use crate::tui::{
     SharedState,
-    state::{FileInfo, PageStatusInfo},
+    state::{FileInfo, PageStatusInfo, ProcessingStatus},
     tui_loop,
 };
 
@@ -21,47 +24,119 @@ use super::pdf::process_pdf;
 
 pub async fn run_tui(
     pool: DbPool,
-    pdf_path: PathBuf,
+    pdf_path: Option<PathBuf>,
     start_page: i32,
     end_page: i32,
-    command: Option<crate::cli::Command>,
-    state: SharedState,
+    process_args: Option<crate::cli::ProcessArgs>,
+    settings: crate::db::settings::Settings,
 ) -> Result<(), AppError> {
-    let settings = db_settings::get_settings(&pool).await?;
+    let _process_args = process_args.unwrap_or_default();
+    let state = crate::tui::create_shared_state(settings.clone());
 
-    let filename = pdf_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let state_for_tui = state.clone();
+    let tui_handle = tokio::spawn(async move {
+        tui_loop::run_tui_loop(state_for_tui).await;
+    });
 
-    // Load or create file
-    let file_id = load_or_create_file(&pool, &pdf_path, &filename).await?;
+    let state_for_thread = state.clone();
+    let pool_for_thread = pool.clone();
+    let pdf_path_clone = pdf_path.clone();
+    let settings_clone = settings.clone();
 
-    // Reset processing state
-    db_pages::reset_processing_pages(&pool, file_id).await?;
+    let _processing_thread = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
 
-    // Handle retry command
-    if let Some(crate::cli::Command::RetryFailed) = command {
-        let failed_pages = db_pages::get_failed_pages(&pool, file_id).await?;
-        if !failed_pages.is_empty() {
-            let mut s = state.write().await;
-            s.add_info(format!("Retrying {} failed pages", failed_pages.len()));
-            db_pages::reset_pending_pages(&pool, file_id).await?;
-        }
-    }
+        rt.block_on(async move {
+            if let Some(pdf_path) = pdf_path_clone {
+                let filename = pdf_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
-    // Load file info into state
-    init_file_state(&pool, file_id, state.clone()).await?;
+                if let Err(e) = load_and_process_file(
+                    &pool_for_thread,
+                    Some(pdf_path),
+                    filename,
+                    start_page,
+                    end_page,
+                    &state_for_thread,
+                    &settings_clone,
+                )
+                .await
+                {
+                    let mut s = state_for_thread.write().await;
+                    s.processing_status = ProcessingStatus::Error;
+                    s.add_error(format!("File loading failed: {}", e));
+                }
+            } else {
+                let existing_files = db_files::get_all_files(&pool_for_thread).await.unwrap_or_default();
+                if existing_files.is_empty() {
+                    let mut s = state_for_thread.write().await;
+                    s.processing_status = ProcessingStatus::Error;
+                    s.add_error("No files found to retry".to_string());
+                } else {
+                    let file = existing_files.into_iter().max_by_key(|f| f.id).unwrap();
 
-    // Spawn processing task
-    spawn_processing_task(
-        pool, pdf_path, state, file_id, start_page, end_page, settings,
+                    if let Err(e) = load_and_process_file(
+                        &pool_for_thread,
+                        None,
+                        file.filename,
+                        0,
+                        0,
+                        &state_for_thread,
+                        &settings_clone,
+                    )
+                    .await
+                    {
+                        let mut s = state_for_thread.write().await;
+                        s.processing_status = ProcessingStatus::Error;
+                        s.add_error(format!("File loading failed: {}", e));
+                    }
+                }
+            }
+
+            let mut s = state_for_thread.write().await;
+            s.shutdown = true;
+        });
+    });
+
+    let _ = tui_handle.await;
+
+    Ok(())
+}
+
+async fn load_and_process_file(
+    pool: &DbPool,
+    pdf_path: Option<PathBuf>,
+    filename: String,
+    start_page: i32,
+    end_page: i32,
+    state: &SharedState,
+    settings: &crate::db::settings::Settings,
+) -> Result<(), AppError> {
+    let pdf_path = pdf_path.unwrap_or_else(|| PathBuf::from(&filename));
+
+    let file_id = load_or_create_file(pool, &pdf_path, &filename).await?;
+    db_pages::reset_processing_pages(pool, file_id).await?;
+
+    init_file_state(pool, file_id, state.clone()).await?;
+
+    run_processing_task(
+        pool.clone(),
+        pdf_path,
+        state.clone(),
+        file_id,
+        start_page,
+        end_page,
+        settings.clone(),
     )
     .await
 }
 
-/// Load existing file or create new one
 async fn load_or_create_file(
     pool: &DbPool,
     pdf_path: &std::path::Path,
@@ -84,7 +159,6 @@ async fn load_or_create_file(
     }
 }
 
-/// Initialize state with file and page information
 async fn init_file_state(pool: &DbPool, file_id: i64, state: SharedState) -> Result<(), AppError> {
     let file = db_files::get_file_by_id(pool, file_id)
         .await?
@@ -116,8 +190,7 @@ async fn init_file_state(pool: &DbPool, file_id: i64, state: SharedState) -> Res
     Ok(())
 }
 
-/// Spawn the PDF processing task and run TUI
-async fn spawn_processing_task(
+async fn run_processing_task(
     pool: DbPool,
     pdf_path: PathBuf,
     state: SharedState,
@@ -129,35 +202,39 @@ async fn spawn_processing_task(
     let pool_clone = pool.clone();
     let pdf_path_clone = pdf_path.clone();
     let state_clone = state.clone();
-    let start_page_clone = start_page;
-    let end_page_clone = end_page;
 
-    let client = LlmClient::new(
-        settings.api_model.clone(),
-        settings.max_retries,
-        settings.retry_delay_ms,
-        settings.retry_multiplier,
-        settings.think,
-    );
+    let model_path = settings
+        .model_path
+        .as_ref()
+        .map(Path::new)
+        .ok_or_else(|| AppError::Config("model_path not configured".to_string()))?;
 
-    tokio::spawn(async move {
-        if let Err(e) = process_pdf(
-            &pool_clone,
-            &client,
-            file_id,
-            pdf_path_clone,
-            state_clone,
-            start_page_clone,
-            end_page_clone,
-            settings.max_parallel_questions,
-        )
-        .await
-        {
-            error!("Processing error: {}", e);
-        }
+    let context_size = settings.context_size;
+
+    let devices = settings.devices.as_ref().map(|d| {
+        d.split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect::<Vec<usize>>()
     });
 
-    tui_loop::run_tui_loop(state).await;
+    let mut client = LlmClient::new(model_path, context_size, devices, settings.think)?;
+
+    if let Err(e) = process_pdf(
+        &pool_clone,
+        &mut client,
+        file_id,
+        pdf_path_clone,
+        state_clone,
+        start_page,
+        end_page,
+        settings.max_parallel_questions,
+    )
+    .await
+    {
+        let mut s = state.write().await;
+        s.processing_status = ProcessingStatus::Error;
+        s.add_error(format!("Processing failed: {}", e));
+    }
 
     Ok(())
 }

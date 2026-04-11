@@ -14,6 +14,9 @@ pub struct Settings {
     pub batch_questions_max: i32,
     pub think: bool,
     pub max_parallel_questions: i32,
+    pub model_path: Option<String>,
+    pub context_size: u32,
+    pub devices: Option<String>,
 }
 
 impl Default for Settings {
@@ -27,6 +30,9 @@ impl Default for Settings {
             batch_questions_max: 20,
             think: false,
             max_parallel_questions: 0,
+            model_path: None,
+            context_size: 8192,
+            devices: None,
         }
     }
 }
@@ -52,6 +58,9 @@ pub async fn get_settings(pool: &DbPool) -> Result<Settings, AppError> {
             "max_parallel_questions" => {
                 settings.max_parallel_questions = value.parse().unwrap_or(0);
             }
+            "model_path" => settings.model_path = Some(value),
+            "context_size" => settings.context_size = value.parse().unwrap_or(8192),
+            "devices" => settings.devices = if value.is_empty() { None } else { Some(value) },
             _ => {}
         }
     }

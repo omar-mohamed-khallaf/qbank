@@ -13,10 +13,9 @@ sqlx = { version = "0.8", features = [
   "runtime-tokio-rustls",
   "migrate",
 ] }
-reqwest = { version = "0.13", default-features = false, features = [
-  "json",
-  "rustls",
-] }
+llama-cpp-2 = { version = "0.1.143", features = ["vulkan"] }
+encoding_rs = "0.8"
+config = "0.15"
 ratatui = "0.30"
 crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
@@ -31,6 +30,8 @@ clap = { version = "4", features = ["derive"] }
 dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
+llama-cpp-sys-2 = { version = "0.1.143", features = ["vulkan"] }
+rand = "0.10"
 
 [dev-dependencies]
 

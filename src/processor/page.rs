@@ -4,6 +4,7 @@ use anyhow::Result;
 use tracing::{error, info};
 
 use crate::api::LlmClient;
+use crate::db::pages::get_page_status;
 use crate::db::DbPool;
 use crate::error::AppError;
 use crate::pdf as pdf_mod;
@@ -14,50 +15,27 @@ use super::update_page_status;
 
 async fn process_questions_batch(
     pool: &DbPool,
-    client: &LlmClient,
+    client: &mut LlmClient,
     file_id: i64,
     page_num: i32,
     questions: Vec<&str>,
     state: &SharedState,
-    max_parallel: i32,
+    _max_parallel: i32,
 ) -> (i32, bool) {
     let mut total_processed: i32 = 0;
     let mut failed = false;
 
-    if max_parallel > 0 {
-        let mut processed = 0;
-        for chunk in questions.chunks(max_parallel as usize) {
-            let results =
-                futures::future::join_all(chunk.iter().map(|q| {
-                    let q = q.to_string();
-                    let pool = pool.clone();
-                    async move {
-                        process_single_question(&pool, client, file_id, page_num, &q, state).await
-                    }
-                }))
-                .await;
-
-            processed += results.iter().filter(|r| r.is_ok()).count() as i32;
-            if results.iter().any(std::result::Result::is_err) {
-                failed = true;
-                break;
-            }
-        }
-        total_processed = processed;
-    } else {
-        for question_text in &questions {
-            if process_single_question(pool, client, file_id, page_num, question_text, state)
-                .await
-                .is_ok()
-            {
-                total_processed += 1;
-            } else {
-                failed = true;
-                break;
-            }
+    for question_text in &questions {
+        if process_single_question(pool, client, file_id, page_num, question_text, state)
+            .await
+            .is_ok()
+        {
+            total_processed += 1;
+        } else {
+            failed = true;
+            break;
         }
     }
-
     (total_processed, failed)
 }
 
@@ -68,7 +46,7 @@ pub struct PageResult {
 
 pub async fn process_page(
     pool: &DbPool,
-    client: &LlmClient,
+    client: &mut LlmClient,
     file_id: i64,
     pdf_path: &std::path::Path,
     page_num: i32,
@@ -78,6 +56,17 @@ pub async fn process_page(
     max_parallel: i32,
 ) -> Result<PageResult, AppError> {
     let mut new_pending_incomplete: Option<String> = None;
+
+    // Check if already completed
+    if let Ok(Some(page)) = get_page_status(pool, file_id, page_num).await {
+        if page.status == "completed" {
+            info!("Page {} already processed, skipping", page_num);
+            return Ok(PageResult {
+                questions_processed: 0,
+                pending_incomplete: None,
+            });
+        }
+    }
 
     // Mark page as processing in both DB and state
     update_page_status(pool, file_id, page_num, state, "processing", None).await?;

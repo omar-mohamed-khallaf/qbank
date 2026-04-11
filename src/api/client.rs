@@ -1,182 +1,24 @@
-use reqwest::Client;
+use rand::random;
+use std::num::NonZeroU32;
+use std::path::Path;
+
+use encoding_rs::UTF_8;
+use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams};
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::params::LlamaModelParams;
+use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::{LlamaBackendDevice, list_llama_ggml_backend_devices};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
-use tracing::{error, info, warn};
 
+use crate::api::prompts::{NORMALIZER_PROMPT, TUTOR_PROMPT};
 use crate::error::AppError;
-
-const TUTOR_PROMPT: &str = r#"
-Role: Expert Medical Board Tutor. You excel at USMLE/COMLEX-style clinical reasoning, identifying "distractor" patterns, and synthesizing complex patient data into concise differentials.
-
-Task: Analyze the provided medical cases QUICKLY and return a raw JSON array of objects. Each object represents one question.
-
-JSON Schema & Requirements:
-- "q": Copy the question stem exactly as provided (do not include options).
-- "c": An array of objects:
-    {"text": "Option string", "r": boolean}
-    - Preserve option text EXACTLY as given.
-    - Set "r": true for ONLY the single best answer.
-- "e": an object containing:
-    1. "clues": Array of strings of key diagnostic pivot points (age, symptoms, labs, etc.).
-    2. "rep": String of one-sentence formal problem representation using medical terminology.
-    3. "logic": String of step-by-step reasoning from presentation to correct answer.
-    4. "diff": Array of strings of rule-out reasoning for EACH incorrect option.
-    5. "pearls": Array of strings of 3–5 high-yield board facts.
-
-Strict Rules:
-- Do NOT include option labels (A, B, etc.).
-- Do NOT introduce new options.
-- Exactly ONE option must have "r": true.
-- All incorrect options appear in "diff".
-
-Formatting Rules:
-- Output ONLY a raw JSON array.
-- Start with [ and end with ].
-- No markdown, no extra text.
-- Ensure valid JSON (parsable).
-- Escape all internal double quotes (\").
-- Use \n for line breaks inside strings.
-
-Medical Accuracy:
-- If ambiguity exists, choose the most likely "Gold Standard" or "Next Best Step" based on current clinical guidelines.
-- If a question is outdated, choose the most commonly expected board-style answer, not necessarily modern practice.
-- Prefer widely accepted board answers over edge-case interpretations.
-
-Self-Check (before output):
-- JSON is valid and complete
-- Exactly one correct answer
-- All options preserved exactly
-- All incorrect options addressed in "diff"
-
-Return only the JSON array.
-"#;
-
-const NORMALIZER_PROMPT: &str = r#"
-Role: Fast Medical Question Normalizer
-
-You are a high-speed data-cleaning engine. Convert messy, unstructured multiple-choice medical questions into clean, structured JSON immediately.
-
-Task:
-1. Extract the question stem.
-2. Extract and reconstruct answer choices.
-3. Remove all labels or prefixes (a, b, c, d, A., etc.).
-4. Split merged or concatenated options.
-5. Correct obvious medical word errors (e.g., "ethyldopa" → "methyldopa", "ARBs" → "Angiotensin receptor blockers").
-6. Remove meaningless fragments or stray tokens.
-7. Ensure each option is medically valid, readable, and standalone.
-
-Rules:
-- Output 3–6 answer choices.
-- No labels or prefixes.
-- No duplicate or overlapping options.
-- Reconstruct the most likely valid medical options if input is corrupted.
-- Discard unclear fragments that cannot be confidently fixed.
-- Do NOT explain or comment.
-- Ensure each option is complete and meaningful
-
-Output format (STRICT JSON ONLY):
-{
-"q": "<clean question stem>",
-"options": ["option 1", "option 2", "option 3", "option 4"]
-}
-
-Constraints:
-- Return ONLY valid JSON.
-- No markdown, no comments, no trailing text.
-- Use double quotes only.
-- Ensure JSON parses correctly.
-
-Input:
-"#;
-
-const JSON_REPAIR_PROMPT: &str = r#"
-Role: JSON Repair Engine
-
-You are a strict JSON fixer. Your ONLY job is to repair invalid or malformed JSON so that it becomes valid and parsable.
-
-Input:
-You will receive a JSON-like string that may contain errors such as:
-- Missing commas
-- Trailing commas
-- Unescaped quotes
-- Invalid characters
-- Broken structure
-- Incorrect brackets
-
-Task:
-- Fix the JSON so it is syntactically valid.
-- Preserve ALL original data and structure.
-- Do NOT change meanings, wording, or values.
-- Do NOT remove fields unless absolutely necessary for validity.
-- Do NOT add new content.
-
-Rules:
-- Output must be valid JSON.
-- Output must match the original schema as closely as possible.
-- Ensure all strings use double quotes.
-- Escape internal quotes properly (\").
-- Ensure arrays and objects are properly closed.
-- Remove trailing commas.
-- Fix broken nesting.
-
-Strict Output Rules:
-- Return ONLY the fixed JSON.
-- No explanations.
-- No markdown.
-- No comments.
-- Must start with { or [ and end with } or ].
-
-Failure Handling:
-- If the input is too corrupted to fully repair, return the closest valid JSON possible while preserving maximum content.
-
-Self-Check:
-- JSON parses without error
-- No trailing commas
-- Proper escaping
-- Structure intact
-
-Now fix the following JSON:
-"#;
 
 #[derive(Debug, Deserialize)]
 struct NormalizedQuestion {
-    q: String,
-    options: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    think: bool,
-    stream: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaResponse {
-    model: String,
-    message: OllamaMessage,
-    done: bool,
-    done_reason: Option<String>,
-    created_at: Option<String>,
-    total_duration: Option<u64>,
-    #[serde(rename = "prompt_eval_count")]
-    prompt_eval_count: Option<i32>,
-    #[serde(rename = "eval_count")]
-    eval_count: Option<i32>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OllamaMessage {
-    role: String,
-    content: String,
-    thinking: Option<String>,
+    question: String,
+    choices: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,284 +32,253 @@ pub struct ExplanationResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuestionResponse {
-    pub q: String,
-    pub c: Vec<ChoiceResponse>,
-    pub e: ExplanationResponse,
+    pub question: String,
+    pub choices: Vec<ChoiceResponse>,
+    pub explanation: ExplanationResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChoiceResponse {
     pub text: String,
-    pub r: bool,
+    pub correct: bool,
 }
 
-#[derive(Clone)]
 pub struct LlmClient {
-    http_client: Client,
-    model: String,
-    max_retries: i32,
-    retry_delay_ms: u64,
-    retry_multiplier: f64,
+    model: LlamaModel,
+    backend: LlamaBackend,
+    sampler: LlamaSampler,
+    context_size: u32,
     think: bool,
-    stream: bool,
 }
 
 impl LlmClient {
     pub fn new(
-        model: String,
-        max_retries: i32,
-        retry_delay_ms: u64,
-        retry_multiplier: f64,
+        model_path: &Path,
+        context_size: u32,
+        devices: Option<Vec<usize>>,
         think: bool,
-    ) -> Self {
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(180))
-            .build()
-            .expect("Failed to create HTTP client");
-
-        Self {
-            http_client,
-            model,
-            max_retries,
-            retry_delay_ms,
-            retry_multiplier,
-            think,
-            stream: false,
+    ) -> Result<Self, AppError> {
+        let backend = LlamaBackend::init().map_err(|e| AppError::Api(e.to_string()))?;
+        unsafe {
+            llama_cpp_sys_2::llama_log_set(Some(Self::void_log), std::ptr::null_mut());
         }
+
+        let mut model_params = LlamaModelParams::default();
+        model_params = model_params.with_n_gpu_layers(16384);
+
+        if let Some(device_indices) = devices {
+            model_params = model_params
+                .with_devices(&device_indices)
+                .map_err(|e| AppError::Api(e.to_string()))?;
+        }
+
+        let model = LlamaModel::load_from_file(&backend, model_path, &model_params)
+            .map_err(|e| AppError::Api(format!("Failed to load model: {e}")))?;
+
+        let sampler = LlamaSampler::chain_simple([
+            LlamaSampler::temp(0.6),
+            LlamaSampler::top_p(0.95, 1),
+            LlamaSampler::min_p(0.05, 1),
+            LlamaSampler::dist(random::<u32>()),
+        ]);
+
+        Ok(Self {
+            model,
+            backend,
+            sampler,
+            context_size,
+            think,
+        })
     }
 
-    pub async fn process_medical_question(
-        &self,
-        raw_text: &str,
-    ) -> Result<Vec<QuestionResponse>, AppError> {
-        let normalized = self.normalize_question_input(raw_text).await?;
+    unsafe extern "C" fn void_log(
+        level: llama_cpp_sys_2::ggml_log_level,
+        text: *const ::std::os::raw::c_char,
+        _user_data: *mut ::std::os::raw::c_void,
+    ) {
+        let _ = std::panic::catch_unwind(|| {
+            static COUNTER: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+            let prev = *COUNTER.get_or_init(|| level);
 
-        let options_formatted = normalized
-            .options
-            .iter()
-            .map(|o| format!("- {o}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+            if text.is_null() {
+                return;
+            }
+
+            let level = if level == 5 { prev } else { level };
+
+            let c_str = unsafe { std::ffi::CStr::from_ptr(text) };
+
+            let log_text = c_str.to_string_lossy();
+
+            match level {
+                0 => tracing::trace!("{}", log_text.trim()),
+                1 => tracing::debug!("{}", log_text.trim()),
+                2 => tracing::info!("{}", log_text.trim()),
+                3 => tracing::warn!("{}", log_text.trim()),
+                4 => tracing::error!("{}", log_text.trim()),
+                _ => tracing::trace!("{}", log_text.trim()),
+            }
+        });
+    }
+
+    pub fn process_medical_question(
+        &mut self,
+        raw_text: &str,
+    ) -> Result<QuestionResponse, AppError> {
+        let normalized = self.normalize_question_input(raw_text)?;
+
+        let options_formatted = normalized.choices.join("\n");
 
         let tutor_prompt = format!(
-            "{TUTOR_PROMPT}\n\nQUESTION:\n{}\n\nOPTIONS:\n{}",
-            normalized.q, options_formatted
+            "{TUTOR_PROMPT}\nQuestion:{}\nOptions:{}\n",
+            normalized.question, options_formatted
         );
 
-        self.send_tutor_request_with_retry(&tutor_prompt).await
+        let mut last_error = None;
+        for i in 0..2 {
+            let content = self.generate_sync(&tutor_prompt, true)?;
+
+            match serde_json::from_str::<QuestionResponse>(&content) {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    tracing::warn!("Tutor parse attempt {} failed: {e}", i + 1);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        let err = last_error.map_or_else(|| "Unknown error".into(), |e| e.to_string());
+        Err(AppError::Api(format!(
+            "Tutor failed to generate valid JSON: {err}"
+        )))
     }
 
-    async fn normalize_question_input(
-        &self,
-        raw_text: &str,
-    ) -> Result<NormalizedQuestion, AppError> {
-        let mut attempt = 0;
-        let mut delay_ms = self.retry_delay_ms;
+    fn normalize_question_input(&mut self, raw_text: &str) -> Result<NormalizedQuestion, AppError> {
+        let prompt = format!("{NORMALIZER_PROMPT}\n{raw_text}");
+        let max_attempts = 3;
 
-        loop {
-            attempt += 1;
-            info!("Normalization attempt {}/{}", attempt, self.max_retries + 1);
+        for i in 0..max_attempts {
+            let content = self.generate_sync(&prompt, true)?;
 
-            let prompt = format!("{NORMALIZER_PROMPT}\n{raw_text}");
+            match serde_json::from_str::<NormalizedQuestion>(&content) {
+                Ok(normalized) => return Ok(normalized),
+                Err(e) => {
+                    if i == max_attempts - 1 {
+                        tracing::error!(
+                            "Final attempt failed. Parse error: {e}. Content: {content}"
+                        );
+                        return Err(AppError::Api(format!(
+                            "JSON parse error after {max_attempts} tries"
+                        )));
+                    }
 
-            let request = ChatRequest {
-                model: self.model.clone(),
-                messages: vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: prompt,
-                }],
-                think: false,
-                stream: false,
+                    tracing::warn!(
+                        "Attempt {}/{} failed to parse JSON. Retrying...",
+                        i + 1,
+                        max_attempts
+                    );
+                }
+            }
+        }
+
+        Err(AppError::Api("Unknown normalization error".into()))
+    }
+
+    fn generate_sync(&mut self, prompt: &str, think: bool) -> Result<String, AppError> {
+        let full_prompt = format!(
+            "<｜User｜>{prompt}<｜Assistant｜>{}",
+            if think { "" } else { "<think>\n\n\n" }
+        );
+
+        let tokens = self
+            .model
+            .str_to_token(&full_prompt, AddBos::Always)
+            .map_err(|e| AppError::Api(e.to_string()))?;
+
+        let n_tokens = tokens.len() as u32;
+
+        if n_tokens >= self.context_size {
+            return Err(AppError::Api("Prompt too long for context size".into()));
+        }
+        let max_tokens = self.context_size - n_tokens;
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(self.context_size))
+            .with_flash_attention_policy(1)
+            .with_n_threads(8)
+            .with_type_v(KvCacheType::Q4_0)
+            .with_type_k(KvCacheType::Q4_0);
+
+        let mut context = self
+            .model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| AppError::Api(e.to_string()))?;
+
+        let mut batch = LlamaBatch::new(n_tokens.max(512) as usize, 1);
+
+        batch
+            .add_sequence(&tokens, 0, true)
+            .map_err(|e| AppError::Api(e.to_string()))?;
+        context
+            .decode(&mut batch)
+            .map_err(|e| AppError::Api(e.to_string()))?;
+
+        let mut generated_tokens = Vec::new();
+
+        for i in 0..max_tokens {
+            let token = self.sampler.sample(&context, 0);
+
+            if token == self.model.token_eos() {
+                break;
+            }
+
+            generated_tokens.push(token);
+
+            batch.clear();
+            batch
+                .add(token, (n_tokens + i) as i32, &[0], true)
+                .map_err(|e| AppError::Api(e.to_string()))?;
+
+            context
+                .decode(&mut batch)
+                .map_err(|e| AppError::Api(e.to_string()))?;
+        }
+
+        let mut decoder = UTF_8.new_decoder();
+        let mut output = String::new();
+        for t in &generated_tokens {
+            let piece = self
+                .model
+                .token_to_piece(*t, &mut decoder, true, None)
+                .map_err(|e| AppError::Api(e.to_string()))?;
+            output.push_str(&piece);
+        }
+
+        if output.trim().is_empty() {
+            return Err(AppError::Api("Generated output is empty".to_string()));
+        }
+
+        let json_str = {
+            let body = if let Some(think_end) = output.find("</think>") {
+                &output[think_end + 8..]
+            } else {
+                &output
             };
 
-            match self
-                .http_client
-                .post("http://localhost:11434/api/chat")
-                .header("Content-Type", "application/json")
-                .json(&request)
-                .send()
-                .await
+            if let Some(start_idx) = body.find('{')
+                && let Some(end_idx) = body.rfind('}')
+                && end_idx > start_idx
             {
-                Ok(response) if response.status().is_success() => {
-                    let bytes = response.bytes().await.unwrap_or_default();
-                    let ollama_response: OllamaResponse = serde_json::from_slice(&bytes)?;
-                    let content = ollama_response.message.content;
-
-                    let parsed: NormalizedQuestion = if let Ok(v) = serde_json::from_str(&content) {
-                        v
-                    } else {
-                        let fixed = self.repair_json_output(&content).await?;
-                        serde_json::from_str(&fixed).map_err(|e| {
-                            AppError::Api(format!(
-                                "Failed to parse repaired normalization output: {e} - Content: {fixed}"
-                            ))
-                        })?
-                    };
-
-                    info!("Normalization successful on attempt {}", attempt);
-                    return Ok(parsed);
-                }
-                Ok(response) => {
-                    let status = response.status();
-                    let error_text = response.text().await.unwrap_or_default();
-                    let err = AppError::Api(format!(
-                        "Normalization API returned status {status}: {error_text}"
-                    ));
-                    if attempt <= self.max_retries {
-                        warn!("Normalization failed (attempt {}): {}", attempt, err);
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        delay_ms = (delay_ms as f64 * self.retry_multiplier) as u64;
-                    } else {
-                        return Err(err);
-                    }
-                }
-                Err(e) => {
-                    let err = AppError::Api(format!("Normalization request failed: {e}"));
-                    if attempt <= self.max_retries {
-                        warn!("Normalization failed (attempt {}): {}", attempt, e);
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        delay_ms = (delay_ms as f64 * self.retry_multiplier) as u64;
-                    } else {
-                        return Err(err);
-                    }
-                }
+                &body[start_idx..=end_idx]
+            } else {
+                body.trim()
             }
-        }
-    }
-
-    async fn repair_json_output(&self, broken_json: &str) -> Result<String, AppError> {
-        let prompt = format!("{JSON_REPAIR_PROMPT}\n{broken_json}");
-
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt,
-            }],
-            think: false,
-            stream: false,
         };
 
-        let response = self
-            .http_client
-            .post("http://localhost:11434/api/chat")
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::Api(format!(
-                "JSON repair API returned status {status}: {error_text}"
-            )));
-        }
-
-        let bytes = response.bytes().await.unwrap_or_default();
-        let ollama_response: OllamaResponse = serde_json::from_slice(&bytes)?;
-        let content = ollama_response.message.content;
-
-        Ok(content)
+        Ok(json_str.to_string())
     }
+}
 
-    async fn send_tutor_request_with_retry(
-        &self,
-        prompt: &str,
-    ) -> Result<Vec<QuestionResponse>, AppError> {
-        let mut attempt = 0;
-        let mut delay_ms = self.retry_delay_ms;
-        let base_prompt = prompt.to_string();
-
-        loop {
-            attempt += 1;
-            info!("Tutor request attempt {}/{}", attempt, self.max_retries + 1);
-
-            let enhanced_prompt = match attempt {
-                1 => base_prompt.clone(),
-                2 => format!("{base_prompt}\n\nFix formatting. Return valid JSON only."),
-                _ => format!(
-                    "{base_prompt}\n\nYour previous output was invalid. Output MUST be valid JSON with exactly one correct answer."
-                ),
-            };
-
-            match self.execute_tutor_request(&enhanced_prompt).await {
-                Ok(response) => {
-                    info!("Tutor request successful on attempt {}", attempt);
-                    return Ok(response);
-                }
-                Err(e) if attempt <= self.max_retries => {
-                    warn!("Tutor request failed (attempt {}): {}", attempt, e);
-                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    #[allow(
-                        clippy::cast_possible_truncation,
-                        clippy::cast_sign_loss,
-                        clippy::cast_precision_loss
-                    )]
-                    {
-                        let next_delay_f64 = delay_ms as f64 * self.retry_multiplier;
-                        delay_ms = next_delay_f64.clamp(0.0, u64::MAX as f64) as u64;
-                    }
-                }
-                Err(e) => {
-                    error!("Tutor request failed after {} attempts: {}", attempt, e);
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    async fn execute_tutor_request(&self, prompt: &str) -> Result<Vec<QuestionResponse>, AppError> {
-        let request = ChatRequest {
-            model: self.model.clone(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
-            think: self.think,
-            stream: self.stream,
-        };
-
-        let response = self
-            .http_client
-            .post("http://localhost:11434/api/chat")
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-            return Err(AppError::Api(format!(
-                "API returned status {status}: {error_text}"
-            )));
-        }
-
-        let bytes = response.bytes().await.unwrap_or_default();
-        let ollama_response: OllamaResponse = serde_json::from_slice(&bytes)?;
-
-        let content = ollama_response.message.content;
-
-        let parsed: Vec<QuestionResponse> = if let Ok(v) = serde_json::from_str(&content) {
-            v
-        } else {
-            let fixed = self.repair_json_output(&content).await?;
-            serde_json::from_str(&fixed).map_err(|e| {
-                AppError::Api(format!(
-                    "Failed to parse repaired tutor output: {e} - Content: {fixed}"
-                ))
-            })?
-        };
-
-        let correct_count = parsed.iter().flat_map(|q| &q.c).filter(|c| c.r).count();
-
-        if correct_count != 1 {
-            return Err(AppError::Api(format!(
-                "Invalid correct answer count: expected 1, got {correct_count}"
-            )));
-        }
-
-        Ok(parsed)
-    }
+pub fn list_devices() -> Vec<LlamaBackendDevice> {
+    list_llama_ggml_backend_devices()
 }
